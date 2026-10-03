@@ -1,0 +1,109 @@
+# Written by hexad (Settings, Runner, Install/Update workflow); hexad replaces it, so do not edit it here.
+# This repository is public: inputs and logs are visible to anyone. The one secret input is encrypted (AES-GCM) with the
+# repository secret HEXAD_BOX_KEY, and the first step masks every value in it before anything can print it.
+name: hexad-box
+run-name: hexad-box ${{ inputs.session }} ${{ inputs.job }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      session:
+        description: The hexad session this box serves
+        required: true
+      job:
+        description: This job's nonce, to find the run
+        required: true
+      bootstrap:
+        description: Encrypted bootstrap (only hexad can read it)
+        required: true
+
+permissions: {}
+
+jobs:
+  box:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - name: Decrypt the bootstrap and mask it
+        env:
+          HEXAD_KEY: ${{ secrets.HEXAD_BOX_KEY }}
+          HEXAD_BOOTSTRAP: ${{ inputs.bootstrap }}
+          HEXAD_SESSION: ${{ inputs.session }}
+        run: |
+          node <<'JS'
+          const crypto = require('crypto'), fs = require('fs'), path = require('path');
+          const all = Buffer.from(process.env.HEXAD_BOOTSTRAP, 'base64');
+          const d = crypto.createDecipheriv('aes-256-gcm', Buffer.from(process.env.HEXAD_KEY, 'base64'), all.subarray(0, 12));
+          d.setAAD(Buffer.from(process.env.HEXAD_SESSION));
+          d.setAuthTag(all.subarray(all.length - 16));
+          const b = JSON.parse(Buffer.concat([d.update(all.subarray(12, all.length - 16)), d.final()]).toString('utf8'));
+          const masks = new Set();
+          for (const f of ['server', 'tunnelToken', 'joinCode', 'deployKey', 'repo', 'branch']) {
+            const v = b[f];
+            if (!v) continue;
+            // One line per command: a multi-line value is masked line by line, never whole.
+            if (v.includes('\n')) { for (const l of v.split('\n')) if (l.trim()) masks.add(l.trim()); }
+            else masks.add(v);
+          }
+          try { masks.add(new URL(b.server).hostname); } catch (e) { }
+          for (const m of masks) console.log('::add-mask::' + m);
+          const tmp = process.env.RUNNER_TEMP;
+          fs.writeFileSync(path.join(tmp, 'hexad_key'), b.deployKey.endsWith('\n') ? b.deployKey : b.deployKey + '\n', { mode: 0o600 });
+          const env = {
+            HEXAD_SERVER: b.server, HEXAD_TUNNEL_TOKEN: b.tunnelToken, HEXAD_JOIN_CODE: b.joinCode, HEXAD_REPO: b.repo, HEXAD_BRANCH: b.branch,
+            HEXAD_BUILD: b.build, HEXAD_LABEL: b.label, HEXAD_IDLE: String(b.idleMinutes), HEXAD_MAX: String(b.maxMinutes),
+          };
+          for (const [k, v] of Object.entries(env)) {
+            const eof = 'EOF_' + crypto.randomBytes(8).toString('hex');
+            fs.appendFileSync(process.env.GITHUB_ENV, k + '<<' + eof + '\n' + v + '\n' + eof + '\n');
+          }
+          JS
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Join hexad and download the daemon
+        run: |
+          set -euo pipefail
+          auth="X-Tunnel-Authorization: tunnel $HEXAD_TUNNEL_TOKEN"
+          reply=$(curl -fsS --retry 3 --retry-delay 3 -X POST -H "$auth" -H 'Content-Type: application/json' -d "{\"code\":\"$HEXAD_JOIN_CODE\"}" "$HEXAD_SERVER/daemon/join")
+          token=$(printf '%s' "$reply" | jq -r .token)
+          echo "::add-mask::$token"
+          echo "HEXAD_DAEMON_TOKEN=$token" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/daemon"
+          curl -fsS --retry 3 --retry-delay 3 -H "$auth" -H "Authorization: Bearer $token" "$HEXAD_SERVER/daemon/bundle/$HEXAD_BUILD" -o "$RUNNER_TEMP/daemon.zip"
+          unzip -q "$RUNNER_TEMP/daemon.zip" -d "$RUNNER_TEMP/daemon/$HEXAD_BUILD"
+
+      - name: Clone the session branch
+        run: |
+          set -euo pipefail
+          export GIT_SSH_COMMAND="ssh -i $RUNNER_TEMP/hexad_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$RUNNER_TEMP/known_hosts"
+          git clone -q --branch "$HEXAD_BRANCH" "git@github.com:$HEXAD_REPO.git" "$HOME/box"
+          git -C "$HOME/box" config user.name hexad
+          git -C "$HOME/box" config user.email hexad@localhost
+          echo "GIT_SSH_COMMAND=$GIT_SSH_COMMAND" >> "$GITHUB_ENV"
+
+      - name: Run the daemon (until hexad stops it, it idles out, or the time limit)
+        timeout-minutes: 350
+        run: |
+          d="$RUNNER_TEMP/daemon/$HEXAD_BUILD"
+          mkdir -p "$RUNNER_TEMP/scratch"
+          dotnet exec --runtimeconfig "$d/Hexad.Daemon.runtimeconfig.json" --depsfile "$d/Hexad.Daemon.deps.json" "$d/Hexad.Daemon.dll" \
+            --root "$HOME/box" --connect "${HEXAD_SERVER/#https:/wss:}/daemon" \
+            --checkpoint-mode branch --scratch "$RUNNER_TEMP/scratch" --bundles "$RUNNER_TEMP/daemon" --update none \
+            --label "$HEXAD_LABEL" --idle-exit "$HEXAD_IDLE" --max-minutes "$HEXAD_MAX" --max-attempts 60 || echo "the daemon exited with $?"
+
+      - name: Push the work to the session branch
+        if: always()
+        run: |
+          cd "$HOME/box" || exit 0
+          git add -A
+          git diff --cached --quiet || git commit -q -m "hexad: work at the end of the runner job"
+          git push -q origin HEAD || echo "::warning::the final push failed; the last checkpoint is on the branch"
+
+      # Room for phase 2 (backlog: Runner sandboxes: snapshots, hand-off and resume): after the daemon has exited and the work is pushed,
+      # a save step (Actions cache of the tools and state worth keeping) goes here. The daemon runs directly on the runner, not in a container.
+      - name: Save the runner's state (reserved)
+        if: always()
+        run: echo "nothing to save yet"
