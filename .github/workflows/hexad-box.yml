@@ -1,6 +1,11 @@
 # Written by hexad (Settings, Runner, Install/Update workflow); hexad replaces it, so do not edit it here.
 # This repository is public: inputs and logs are visible to anyone. The one secret input is encrypted (AES-GCM) with the
 # repository secret HEXAD_BOX_KEY, and the first step masks every value in it before anything can print it.
+# Runs on Linux (ubuntu-latest) or Windows (windows-latest), chosen per session by the dispatch input os; every step runs in bash.
+# Caches: package folders are shared by every session (keyed on lockfile hashes); the workspace's build folders belong to one
+# session (ws-<base>-<session>-<run>), restored newest first, and a new session starts from the newest of its project's base branch.
+# Outside contributors' workflows must need approval in this repository (Settings, Actions, General), because pull-request
+# workflows can read the base branch's caches.
 name: hexad-box
 run-name: hexad-box ${{ inputs.session }} ${{ inputs.job }}
 
@@ -16,13 +21,30 @@ on:
       bootstrap:
         description: Encrypted bootstrap (only hexad can read it)
         required: true
+      base:
+        description: Which project and base branch the workspace caches belong to (a hash)
+        required: false
+        default: none
+      os:
+        description: The runner's operating system
+        required: false
+        type: choice
+        default: linux
+        options:
+          - linux
+          - windows
 
 permissions: {}
 
 jobs:
   box:
-    runs-on: ubuntu-latest
-    timeout-minutes: 355
+    runs-on: ${{ inputs.os == 'windows' && 'windows-latest' || 'ubuntu-latest' }}
+    timeout-minutes: 350
+    # Every step runs in bash (Git Bash on Windows), so the same scripts serve both systems; HEXAD_TMP and HEXAD_BOX are
+    # the runner's temp folder and the clone with forward slashes (the first step sets them), because git runs its ssh command through sh.
+    defaults:
+      run:
+        shell: bash
     steps:
       - name: Decrypt the bootstrap and mask it
         env:
@@ -49,7 +71,10 @@ jobs:
           for (const m of masks) console.log('::add-mask::' + m);
           const tmp = process.env.RUNNER_TEMP;
           fs.writeFileSync(path.join(tmp, 'hexad_key'), b.deployKey.endsWith('\n') ? b.deployKey : b.deployKey + '\n', { mode: 0o600 });
+          // Paths for bash and for git's ssh (which runs the command through sh): forward slashes, also on Windows (D:\a\_temp -> D:/a/_temp).
+          const slash = s => (s || '').replace(/\\/g, '/');
           const env = {
+            HEXAD_TMP: slash(tmp), HEXAD_BOX: slash(process.env.GITHUB_WORKSPACE) + '/box', HEXAD_OS: process.platform === 'win32' ? 'windows' : 'linux',
             HEXAD_SERVER: b.server, HEXAD_TUNNEL_TOKEN: b.tunnelToken, HEXAD_JOIN_CODE: b.joinCode, HEXAD_REPO: b.repo, HEXAD_BRANCH: b.branch,
             HEXAD_BUILD: b.build, HEXAD_LABEL: b.label, HEXAD_IDLE: String(b.idleMinutes), HEXAD_MAX: String(b.maxMinutes),
           };
@@ -68,42 +93,174 @@ jobs:
           set -euo pipefail
           auth="X-Tunnel-Authorization: tunnel $HEXAD_TUNNEL_TOKEN"
           reply=$(curl -fsS --retry 3 --retry-delay 3 -X POST -H "$auth" -H 'Content-Type: application/json' -d "{\"code\":\"$HEXAD_JOIN_CODE\"}" "$HEXAD_SERVER/daemon/join")
-          token=$(printf '%s' "$reply" | jq -r .token)
+          # node parses the reply: it is on both runner images, so the step needs no other JSON tool.
+          token=$(printf '%s' "$reply" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>process.stdout.write(JSON.parse(s).token))")
           echo "::add-mask::$token"
           echo "HEXAD_DAEMON_TOKEN=$token" >> "$GITHUB_ENV"
-          mkdir -p "$RUNNER_TEMP/daemon"
-          curl -fsS --retry 3 --retry-delay 3 -H "$auth" -H "Authorization: Bearer $token" "$HEXAD_SERVER/daemon/bundle/$HEXAD_BUILD" -o "$RUNNER_TEMP/daemon.zip"
-          unzip -q "$RUNNER_TEMP/daemon.zip" -d "$RUNNER_TEMP/daemon/$HEXAD_BUILD"
+          mkdir -p "$HEXAD_TMP/daemon"
+          curl -fsS --retry 3 --retry-delay 3 -H "$auth" -H "Authorization: Bearer $token" "$HEXAD_SERVER/daemon/bundle/$HEXAD_BUILD" -o "$HEXAD_TMP/daemon.zip"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            # Git Bash has no unzip; Windows PowerShell's Expand-Archive does the same.
+            powershell -NoProfile -Command "Expand-Archive -LiteralPath '$(cygpath -w "$HEXAD_TMP/daemon.zip")' -DestinationPath '$(cygpath -w "$HEXAD_TMP/daemon/$HEXAD_BUILD")' -Force"
+          else
+            unzip -q "$HEXAD_TMP/daemon.zip" -d "$HEXAD_TMP/daemon/$HEXAD_BUILD"
+          fi
 
       - name: Clone the session branch
         run: |
           set -euo pipefail
-          export GIT_SSH_COMMAND="ssh -i $RUNNER_TEMP/hexad_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$RUNNER_TEMP/known_hosts"
-          git clone -q --branch "$HEXAD_BRANCH" "git@github.com:$HEXAD_REPO.git" "$HOME/box"
-          git -C "$HOME/box" config user.name hexad
-          git -C "$HOME/box" config user.email hexad@localhost
+          chmod 600 "$HEXAD_TMP/hexad_key"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            # ssh refuses a key other accounts can read, and a file made by node on Windows inherits the folder's ACL: keep it to the runner's own account.
+            icacls "$(cygpath -w "$HEXAD_TMP/hexad_key")" /inheritance:r /grant:r "$USERNAME:R" > /dev/null || echo "::warning::could not restrict the deploy key's permissions"
+          fi
+          export GIT_SSH_COMMAND="ssh -i $HEXAD_TMP/hexad_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$HEXAD_TMP/known_hosts"
+          # No line-ending conversion (Git for Windows defaults to autocrlf=true): the files stay as they are on the branch.
+          git clone -q -c core.autocrlf=false --branch "$HEXAD_BRANCH" "git@github.com:$HEXAD_REPO.git" "$HEXAD_BOX"
+          git -C "$HEXAD_BOX" config core.autocrlf false
+          git -C "$HEXAD_BOX" config user.name hexad
+          git -C "$HEXAD_BOX" config user.email hexad@localhost
           echo "GIT_SSH_COMMAND=$GIT_SSH_COMMAND" >> "$GITHUB_ENV"
 
+      - name: Restore the package caches (Linux)
+        if: inputs.os != 'windows'
+        id: pkg-linux
+        continue-on-error: true
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.npm
+            ~/.nuget/packages
+            ~/.cache/pip
+            ~/.cache/yarn
+            ~/.local/share/pnpm/store
+            ~/.cargo/registry
+            ~/go/pkg/mod
+            ~/.m2/repository
+          key: pkg-${{ runner.os }}-${{ hashFiles('box/**/package-lock.json', 'box/**/yarn.lock', 'box/**/pnpm-lock.yaml', 'box/**/packages.lock.json', 'box/**/Directory.Packages.props', 'box/**/*.csproj', 'box/**/requirements*.txt', 'box/**/poetry.lock', 'box/**/Cargo.lock', 'box/**/go.sum', 'box/**/pom.xml') }}
+          restore-keys: |
+            pkg-${{ runner.os }}-
+
+      - name: Restore the package caches (Windows)
+        if: inputs.os == 'windows'
+        id: pkg-windows
+        continue-on-error: true
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~\AppData\Local\npm-cache
+            ~\.nuget\packages
+            ~\AppData\Local\pip\Cache
+            ~\AppData\Local\Yarn\Cache
+            ~\AppData\Local\pnpm\store
+            ~\.cargo\registry
+            ~\go\pkg\mod
+            ~\.m2\repository
+          key: pkg-${{ runner.os }}-${{ hashFiles('box/**/package-lock.json', 'box/**/yarn.lock', 'box/**/pnpm-lock.yaml', 'box/**/packages.lock.json', 'box/**/Directory.Packages.props', 'box/**/*.csproj', 'box/**/requirements*.txt', 'box/**/poetry.lock', 'box/**/Cargo.lock', 'box/**/go.sum', 'box/**/pom.xml') }}
+          restore-keys: |
+            pkg-${{ runner.os }}-
+
+      - name: Restore the workspace's build folders
+        id: ws
+        continue-on-error: true
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            box/**/bin
+            box/**/obj
+            box/**/node_modules
+            box/**/dist
+            box/**/build
+            box/**/target
+            box/**/.venv
+            box/**/__pycache__
+            !box/**/bin/**/bin
+            !box/**/obj/**/obj
+            !box/**/node_modules/**/node_modules
+            !box/**/dist/**/dist
+            !box/**/build/**/build
+            !box/**/target/**/target
+            !box/**/.venv/**/.venv
+            !box/**/__pycache__/**/__pycache__
+            !box/.git
+          key: ws-${{ runner.os }}-${{ inputs.base }}-${{ inputs.session }}-restore
+          restore-keys: |
+            ws-${{ runner.os }}-${{ inputs.base }}-${{ inputs.session }}-
+            ws-${{ runner.os }}-${{ inputs.base }}-
+
       - name: Run the daemon (until hexad stops it, it idles out, or the time limit)
-        timeout-minutes: 350
+        timeout-minutes: 345
         run: |
-          d="$RUNNER_TEMP/daemon/$HEXAD_BUILD"
-          mkdir -p "$RUNNER_TEMP/scratch"
+          d="$HEXAD_TMP/daemon/$HEXAD_BUILD"
+          mkdir -p "$HEXAD_TMP/hexad-scratch"
           dotnet exec --runtimeconfig "$d/Hexad.Daemon.runtimeconfig.json" --depsfile "$d/Hexad.Daemon.deps.json" "$d/Hexad.Daemon.dll" \
-            --root "$HOME/box" --connect "${HEXAD_SERVER/#https:/wss:}/daemon" \
-            --checkpoint-mode branch --scratch "$RUNNER_TEMP/scratch" --bundles "$RUNNER_TEMP/daemon" --update none \
+            --root "$HEXAD_BOX" --connect "${HEXAD_SERVER/#https:/wss:}/daemon" \
+            --checkpoint-mode branch --scratch "$HEXAD_TMP/hexad-scratch" --bundles "$HEXAD_TMP/daemon" --update none \
             --label "$HEXAD_LABEL" --idle-exit "$HEXAD_IDLE" --max-minutes "$HEXAD_MAX" --max-attempts 60 || echo "the daemon exited with $?"
 
       - name: Push the work to the session branch
         if: always()
         run: |
-          cd "$HOME/box" || exit 0
+          cd "$HEXAD_BOX" || exit 0
           git add -A
           git diff --cached --quiet || git commit -q -m "hexad: work at the end of the runner job"
           git push -q origin HEAD || echo "::warning::the final push failed; the last checkpoint is on the branch"
 
-      # Room for phase 2 (backlog: Runner sandboxes: snapshots, hand-off and resume): after the daemon has exited and the work is pushed,
-      # a save step (Actions cache of the tools and state worth keeping) goes here. The daemon runs directly on the runner, not in a container.
-      - name: Save the runner's state (reserved)
+      # The reserved final steps: after the daemon has exited and the work is pushed, the caches are saved (a cache that cannot be saved
+      # is a warning, never a failure of the job).
+      - name: Save the workspace's build folders
         if: always()
-        run: echo "nothing to save yet"
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            box/**/bin
+            box/**/obj
+            box/**/node_modules
+            box/**/dist
+            box/**/build
+            box/**/target
+            box/**/.venv
+            box/**/__pycache__
+            !box/**/bin/**/bin
+            !box/**/obj/**/obj
+            !box/**/node_modules/**/node_modules
+            !box/**/dist/**/dist
+            !box/**/build/**/build
+            !box/**/target/**/target
+            !box/**/.venv/**/.venv
+            !box/**/__pycache__/**/__pycache__
+            !box/.git
+          key: ws-${{ runner.os }}-${{ inputs.base }}-${{ inputs.session }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Save the package caches (Linux)
+        if: always() && inputs.os != 'windows' && steps.pkg-linux.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.npm
+            ~/.nuget/packages
+            ~/.cache/pip
+            ~/.cache/yarn
+            ~/.local/share/pnpm/store
+            ~/.cargo/registry
+            ~/go/pkg/mod
+            ~/.m2/repository
+          key: pkg-${{ runner.os }}-${{ hashFiles('box/**/package-lock.json', 'box/**/yarn.lock', 'box/**/pnpm-lock.yaml', 'box/**/packages.lock.json', 'box/**/Directory.Packages.props', 'box/**/*.csproj', 'box/**/requirements*.txt', 'box/**/poetry.lock', 'box/**/Cargo.lock', 'box/**/go.sum', 'box/**/pom.xml') }}
+
+      - name: Save the package caches (Windows)
+        if: always() && inputs.os == 'windows' && steps.pkg-windows.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~\AppData\Local\npm-cache
+            ~\.nuget\packages
+            ~\AppData\Local\pip\Cache
+            ~\AppData\Local\Yarn\Cache
+            ~\AppData\Local\pnpm\store
+            ~\.cargo\registry
+            ~\go\pkg\mod
+            ~\.m2\repository
+          key: pkg-${{ runner.os }}-${{ hashFiles('box/**/package-lock.json', 'box/**/yarn.lock', 'box/**/pnpm-lock.yaml', 'box/**/packages.lock.json', 'box/**/Directory.Packages.props', 'box/**/*.csproj', 'box/**/requirements*.txt', 'box/**/poetry.lock', 'box/**/Cargo.lock', 'box/**/go.sum', 'box/**/pom.xml') }}
