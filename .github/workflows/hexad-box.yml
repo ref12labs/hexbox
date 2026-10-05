@@ -60,13 +60,15 @@ jobs:
           d.setAuthTag(all.subarray(all.length - 16));
           const b = JSON.parse(Buffer.concat([d.update(all.subarray(12, all.length - 16)), d.final()]).toString('utf8'));
           const masks = new Set();
-          for (const f of ['server', 'tunnelToken', 'joinCode', 'deployKey', 'repo', 'branch']) {
+          for (const f of ['server', 'tunnelToken', 'tunnelHeaders', 'joinCode', 'deployKey', 'repo', 'branch']) {
             const v = b[f];
             if (!v) continue;
             // One line per command: a multi-line value is masked line by line, never whole.
             if (v.includes('\n')) { for (const l of v.split('\n')) if (l.trim()) masks.add(l.trim()); }
             else masks.add(v);
           }
+          // Each header line's value is masked on its own too (a log line would print the value alone).
+          for (const l of (b.tunnelHeaders || '').split('\n')) { const i = l.indexOf(':'); if (i > 0 && l.slice(i + 1).trim()) masks.add(l.slice(i + 1).trim()); }
           try { masks.add(new URL(b.server).hostname); } catch (e) { }
           for (const m of masks) console.log('::add-mask::' + m);
           const tmp = process.env.RUNNER_TEMP;
@@ -75,7 +77,7 @@ jobs:
           const slash = s => (s || '').replace(/\\/g, '/');
           const env = {
             HEXAD_TMP: slash(tmp), HEXAD_BOX: slash(process.env.GITHUB_WORKSPACE) + '/box', HEXAD_OS: process.platform === 'win32' ? 'windows' : 'linux',
-            HEXAD_SERVER: b.server, HEXAD_TUNNEL_TOKEN: b.tunnelToken, HEXAD_JOIN_CODE: b.joinCode, HEXAD_REPO: b.repo, HEXAD_BRANCH: b.branch,
+            HEXAD_SERVER: b.server, HEXAD_TUNNEL_TOKEN: b.tunnelToken || '', HEXAD_TUNNEL_HEADERS: b.tunnelHeaders || '', HEXAD_JOIN_CODE: b.joinCode, HEXAD_REPO: b.repo, HEXAD_BRANCH: b.branch,
             HEXAD_BUILD: b.build, HEXAD_LABEL: b.label, HEXAD_IDLE: String(b.idleMinutes), HEXAD_MAX: String(b.maxMinutes),
           };
           for (const [k, v] of Object.entries(env)) {
@@ -91,14 +93,17 @@ jobs:
       - name: Join hexad and download the daemon
         run: |
           set -euo pipefail
-          auth="X-Tunnel-Authorization: tunnel $HEXAD_TUNNEL_TOKEN"
-          reply=$(curl -fsS --retry 3 --retry-delay 3 -X POST -H "$auth" -H 'Content-Type: application/json' -d "{\"code\":\"$HEXAD_JOIN_CODE\"}" "$HEXAD_SERVER/daemon/join")
+          # What the server's door needs on every call: a dev tunnel's token, or the tunnel bus's Access headers (one per line).
+          auth=()
+          if [ -n "${HEXAD_TUNNEL_TOKEN:-}" ]; then auth+=(-H "X-Tunnel-Authorization: tunnel $HEXAD_TUNNEL_TOKEN"); fi
+          while IFS= read -r line; do if [ -n "$line" ]; then auth+=(-H "$line"); fi; done <<< "${HEXAD_TUNNEL_HEADERS:-}"
+          reply=$(curl -fsS --retry 3 --retry-delay 3 -X POST "${auth[@]}" -H 'Content-Type: application/json' -d "{\"code\":\"$HEXAD_JOIN_CODE\"}" "$HEXAD_SERVER/daemon/join")
           # node parses the reply: it is on both runner images, so the step needs no other JSON tool.
           token=$(printf '%s' "$reply" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>process.stdout.write(JSON.parse(s).token))")
           echo "::add-mask::$token"
           echo "HEXAD_DAEMON_TOKEN=$token" >> "$GITHUB_ENV"
           mkdir -p "$HEXAD_TMP/daemon"
-          curl -fsS --retry 3 --retry-delay 3 -H "$auth" -H "Authorization: Bearer $token" "$HEXAD_SERVER/daemon/bundle/$HEXAD_BUILD" -o "$HEXAD_TMP/daemon.zip"
+          curl -fsS --retry 3 --retry-delay 3 "${auth[@]}" -H "Authorization: Bearer $token" "$HEXAD_SERVER/daemon/bundle/$HEXAD_BUILD" -o "$HEXAD_TMP/daemon.zip"
           if [ "$RUNNER_OS" = "Windows" ]; then
             # Git Bash has no unzip; Windows PowerShell's Expand-Archive does the same.
             powershell -NoProfile -Command "Expand-Archive -LiteralPath '$(cygpath -w "$HEXAD_TMP/daemon.zip")' -DestinationPath '$(cygpath -w "$HEXAD_TMP/daemon/$HEXAD_BUILD")' -Force"
@@ -196,7 +201,7 @@ jobs:
           dotnet exec --runtimeconfig "$d/Hexad.Daemon.runtimeconfig.json" --depsfile "$d/Hexad.Daemon.deps.json" "$d/Hexad.Daemon.dll" \
             --root "$HEXAD_BOX" --connect "${HEXAD_SERVER/#https:/wss:}/daemon" \
             --checkpoint-mode branch --scratch "$HEXAD_TMP/hexad-scratch" --bundles "$HEXAD_TMP/daemon" --update none \
-            --label "$HEXAD_LABEL" --idle-exit "$HEXAD_IDLE" --max-minutes "$HEXAD_MAX" --max-attempts 60 || echo "the daemon exited with $?"
+            --label "$HEXAD_LABEL" --idle-exit "$HEXAD_IDLE" --max-minutes "$HEXAD_MAX" --max-attempts 0 || echo "the daemon exited with $?"
 
       - name: Push the work to the session branch
         if: always()
