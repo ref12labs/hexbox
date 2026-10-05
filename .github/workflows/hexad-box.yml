@@ -1,9 +1,12 @@
-# Written by hexad (Settings, Runner, Install/Update workflow); hexad replaces it, so do not edit it here.
+# Written by hexad (Settings, Runner, Install/Update workflow); hexad replaces it when it is outdated, so do not edit it here.
+# STUB_VERSION: 1
+# This file is a stub and rarely changes: it holds only what must be YAML. The logic is in phase scripts that the hexad which starts the
+# job serves (GET /daemon/script/<build>/<phase>), so it always matches that hexad's build.
 # This repository is public: inputs and logs are visible to anyone. The one secret input is encrypted (AES-GCM) with the
-# repository secret HEXAD_BOX_KEY, and the first step masks every value in it before anything can print it.
+# repository secret HEXAD_BOX_KEY, and the prepare step masks every value in it before anything can print it.
 # Runs on Linux (ubuntu-latest) or Windows (windows-latest), chosen per session by the dispatch input os; every step runs in bash.
-# Caches: package folders are shared by every session (keyed on lockfile hashes); the workspace's build folders belong to one
-# session (ws-<base>-<session>-<run>), restored newest first, and a new session starts from the newest of its project's base branch.
+# Caches: hexad's prepare script decides the keys and paths (step outputs) and the actions/cache steps here pass them on. Package folders are
+# shared by every session; the workspace's build folders belong to one session (ws-<os>-<base>-<session>-<run>).
 # Outside contributors' workflows must need approval in this repository (Settings, Actions, General), because pull-request
 # workflows can read the base branch's caches.
 name: hexad-box
@@ -40,17 +43,31 @@ jobs:
   box:
     runs-on: ${{ inputs.os == 'windows' && 'windows-latest' || 'ubuntu-latest' }}
     timeout-minutes: 350
-    # Every step runs in bash (Git Bash on Windows), so the same scripts serve both systems; HEXAD_TMP and HEXAD_BOX are
-    # the runner's temp folder and the clone with forward slashes (the first step sets them), because git runs its ssh command through sh.
     defaults:
       run:
         shell: bash
     steps:
-      - name: Decrypt the bootstrap and mask it
+      # A plain run: step does not get the runner's runtime token and results URL; a JavaScript action does. Pinned to a full commit SHA.
+      - name: Expose the Actions runtime
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        with:
+          script: |
+            // Hands the job the Actions runtime that a plain run: step does not get. The values are masked at once; hexad's daemon and its phase
+            // scripts use them for the Actions cache, and the agent's tools get them too, to reach the cache and artifact APIs of this repository.
+            for (const name of ['ACTIONS_RUNTIME_TOKEN', 'ACTIONS_RESULTS_URL']) {
+              const value = process.env[name];
+              if (!value) { core.warning(name + ' is not set: this job cannot use the Actions cache or artifact APIs directly'); continue; }
+              core.setSecret(value);
+              core.exportVariable(name, value);
+            }
+
+      - name: Prepare (decrypt the bootstrap, join hexad, fetch the scripts)
+        id: prepare
         env:
           HEXAD_KEY: ${{ secrets.HEXAD_BOX_KEY }}
           HEXAD_BOOTSTRAP: ${{ inputs.bootstrap }}
           HEXAD_SESSION: ${{ inputs.session }}
+          HEXAD_BASE: ${{ inputs.base }}
         run: |
           node <<'JS'
           const crypto = require('crypto'), fs = require('fs'), path = require('path');
@@ -77,195 +94,94 @@ jobs:
           const slash = s => (s || '').replace(/\\/g, '/');
           const env = {
             HEXAD_TMP: slash(tmp), HEXAD_BOX: slash(process.env.GITHUB_WORKSPACE) + '/box', HEXAD_OS: process.platform === 'win32' ? 'windows' : 'linux',
+            HEXAD_SESSION: process.env.HEXAD_SESSION, HEXAD_BASE: process.env.HEXAD_BASE || 'none',
             HEXAD_SERVER: b.server, HEXAD_TUNNEL_TOKEN: b.tunnelToken || '', HEXAD_TUNNEL_HEADERS: b.tunnelHeaders || '', HEXAD_JOIN_CODE: b.joinCode, HEXAD_REPO: b.repo, HEXAD_BRANCH: b.branch,
             HEXAD_BUILD: b.build, HEXAD_LABEL: b.label, HEXAD_IDLE: String(b.idleMinutes), HEXAD_MAX: String(b.maxMinutes),
           };
+          const q = v => "'" + String(v).replace(/'/g, "'\\''") + "'";
+          let sh = '';
           for (const [k, v] of Object.entries(env)) {
             const eof = 'EOF_' + crypto.randomBytes(8).toString('hex');
             fs.appendFileSync(process.env.GITHUB_ENV, k + '<<' + eof + '\n' + v + '\n' + eof + '\n');
+            sh += 'export ' + k + '=' + q(v) + '\n';
           }
+          // For the rest of this step only: its shell sources this file and deletes it.
+          fs.writeFileSync(path.join(tmp, 'hexad.env'), sh, { mode: 0o600 });
           JS
-
-      - uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: 10.0.x
-
-      - name: Join hexad and download the daemon
-        run: |
           set -euo pipefail
+          t=$(cygpath -u "$RUNNER_TEMP" 2>/dev/null || printf '%s' "$RUNNER_TEMP")
+          set -a; . "$t/hexad.env"; set +a; rm -f "$t/hexad.env"
+          fail() { echo "::error::$*"; exit 1; }
+          hint="likely missing Access headers or a stale workflow file (update it under Settings, Runner)"
           # What the server's door needs on every call: a dev tunnel's token, or the tunnel bus's Access headers (one per line).
           auth=()
-          if [ -n "${HEXAD_TUNNEL_TOKEN:-}" ]; then auth+=(-H "X-Tunnel-Authorization: tunnel $HEXAD_TUNNEL_TOKEN"); fi
-          while IFS= read -r line; do if [ -n "$line" ]; then auth+=(-H "$line"); fi; done <<< "${HEXAD_TUNNEL_HEADERS:-}"
-          reply=$(curl -fsS --retry 3 --retry-delay 3 -X POST "${auth[@]}" -H 'Content-Type: application/json' -d "{\"code\":\"$HEXAD_JOIN_CODE\"}" "$HEXAD_SERVER/daemon/join")
-          # node parses the reply: it is on both runner images, so the step needs no other JSON tool.
-          token=$(printf '%s' "$reply" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>process.stdout.write(JSON.parse(s).token))")
+          if [ -n "$HEXAD_TUNNEL_TOKEN" ]; then auth+=(-H "X-Tunnel-Authorization: tunnel $HEXAD_TUNNEL_TOKEN"); fi
+          while IFS= read -r line; do if [ -n "$line" ]; then auth+=(-H "$line"); fi; done <<< "$HEXAD_TUNNEL_HEADERS"
+          mkdir -p "$HEXAD_TMP/phases"
+          ct=$(curl -fsS --retry 3 --retry-delay 3 -X POST "${auth[@]}" -H 'Content-Type: application/json' -d "{\"code\":\"$HEXAD_JOIN_CODE\"}" -o "$HEXAD_TMP/join.json" -w '%{content_type}' "$HEXAD_SERVER/daemon/join") || fail "hexad's /daemon/join refused the call (curl's message is above): $hint"
+          case "$ct" in application/json*) ;; *) fail "hexad's /daemon/join answered with $ct, a login or HTML page and not JSON: $hint" ;; esac
+          token=$(sed -n 's/.*"token" *: *"\([^"]*\)".*/\1/p' "$HEXAD_TMP/join.json")
+          rm -f "$HEXAD_TMP/join.json"
+          [ -n "$token" ] || fail "hexad's /daemon/join answered without a token: $hint"
           echo "::add-mask::$token"
           echo "HEXAD_DAEMON_TOKEN=$token" >> "$GITHUB_ENV"
-          mkdir -p "$HEXAD_TMP/daemon"
-          curl -fsS --retry 3 --retry-delay 3 "${auth[@]}" -H "Authorization: Bearer $token" "$HEXAD_SERVER/daemon/bundle/$HEXAD_BUILD" -o "$HEXAD_TMP/daemon.zip"
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            # Git Bash has no unzip; Windows PowerShell's Expand-Archive does the same.
-            powershell -NoProfile -Command "Expand-Archive -LiteralPath '$(cygpath -w "$HEXAD_TMP/daemon.zip")' -DestinationPath '$(cygpath -w "$HEXAD_TMP/daemon/$HEXAD_BUILD")' -Force"
-          else
-            unzip -q "$HEXAD_TMP/daemon.zip" -d "$HEXAD_TMP/daemon/$HEXAD_BUILD"
-          fi
+          export HEXAD_DAEMON_TOKEN="$token"
+          ct=$(curl -fsS --retry 3 --retry-delay 3 "${auth[@]}" -H "Authorization: Bearer $token" -o "$HEXAD_TMP/phases/prepare.sh" -w '%{content_type}' "$HEXAD_SERVER/daemon/script/$HEXAD_BUILD/prepare") || fail "hexad has no phase scripts for build $HEXAD_BUILD (curl's message is above): is this workflow newer than the hexad that started the job?"
+          case "$ct" in text/html*) fail "hexad's prepare script came as an HTML page, not a script: $hint" ;; esac
+          exec bash "$HEXAD_TMP/phases/prepare.sh"
 
-      - name: Clone the session branch
-        run: |
-          set -euo pipefail
-          chmod 600 "$HEXAD_TMP/hexad_key"
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            # ssh refuses a key other accounts can read, and a file made by node on Windows inherits the folder's ACL: keep it to the runner's own account.
-            icacls "$(cygpath -w "$HEXAD_TMP/hexad_key")" /inheritance:r /grant:r "$USERNAME:R" > /dev/null || echo "::warning::could not restrict the deploy key's permissions"
-          fi
-          export GIT_SSH_COMMAND="ssh -i $HEXAD_TMP/hexad_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$HEXAD_TMP/known_hosts"
-          # No line-ending conversion (Git for Windows defaults to autocrlf=true): the files stay as they are on the branch.
-          git clone -q -c core.autocrlf=false --branch "$HEXAD_BRANCH" "git@github.com:$HEXAD_REPO.git" "$HEXAD_BOX"
-          git -C "$HEXAD_BOX" config core.autocrlf false
-          git -C "$HEXAD_BOX" config user.name hexad
-          git -C "$HEXAD_BOX" config user.email hexad@localhost
-          echo "GIT_SSH_COMMAND=$GIT_SSH_COMMAND" >> "$GITHUB_ENV"
-
-      - name: Restore the package caches (Linux)
-        if: inputs.os != 'windows'
-        id: pkg-linux
+      - name: Restore the package caches
+        id: pkg
+        if: steps.prepare.outputs.pkg_key != ''
         continue-on-error: true
         uses: actions/cache/restore@v4
         with:
-          path: |
-            ~/.npm
-            ~/.nuget/packages
-            ~/.cache/pip
-            ~/.cache/yarn
-            ~/.local/share/pnpm/store
-            ~/.cargo/registry
-            ~/go/pkg/mod
-            ~/.m2/repository
-          key: pkg-${{ runner.os }}-${{ hashFiles('box/**/package-lock.json', 'box/**/yarn.lock', 'box/**/pnpm-lock.yaml', 'box/**/packages.lock.json', 'box/**/Directory.Packages.props', 'box/**/*.csproj', 'box/**/requirements*.txt', 'box/**/poetry.lock', 'box/**/Cargo.lock', 'box/**/go.sum', 'box/**/pom.xml') }}
-          restore-keys: |
-            pkg-${{ runner.os }}-
-
-      - name: Restore the package caches (Windows)
-        if: inputs.os == 'windows'
-        id: pkg-windows
-        continue-on-error: true
-        uses: actions/cache/restore@v4
-        with:
-          path: |
-            ~\AppData\Local\npm-cache
-            ~\.nuget\packages
-            ~\AppData\Local\pip\Cache
-            ~\AppData\Local\Yarn\Cache
-            ~\AppData\Local\pnpm\store
-            ~\.cargo\registry
-            ~\go\pkg\mod
-            ~\.m2\repository
-          key: pkg-${{ runner.os }}-${{ hashFiles('box/**/package-lock.json', 'box/**/yarn.lock', 'box/**/pnpm-lock.yaml', 'box/**/packages.lock.json', 'box/**/Directory.Packages.props', 'box/**/*.csproj', 'box/**/requirements*.txt', 'box/**/poetry.lock', 'box/**/Cargo.lock', 'box/**/go.sum', 'box/**/pom.xml') }}
-          restore-keys: |
-            pkg-${{ runner.os }}-
+          path: ${{ steps.prepare.outputs.pkg_paths }}
+          key: ${{ steps.prepare.outputs.pkg_key }}
+          restore-keys: ${{ steps.prepare.outputs.pkg_restore_keys }}
 
       - name: Restore the workspace's build folders
         id: ws
+        if: steps.prepare.outputs.ws_restore_key != ''
         continue-on-error: true
         uses: actions/cache/restore@v4
         with:
-          path: |
-            box/**/bin
-            box/**/obj
-            box/**/node_modules
-            box/**/dist
-            box/**/build
-            box/**/target
-            box/**/.venv
-            box/**/__pycache__
-            !box/**/bin/**/bin
-            !box/**/obj/**/obj
-            !box/**/node_modules/**/node_modules
-            !box/**/dist/**/dist
-            !box/**/build/**/build
-            !box/**/target/**/target
-            !box/**/.venv/**/.venv
-            !box/**/__pycache__/**/__pycache__
-            !box/.git
-          key: ws-${{ runner.os }}-${{ inputs.base }}-${{ inputs.session }}-restore
-          restore-keys: |
-            ws-${{ runner.os }}-${{ inputs.base }}-${{ inputs.session }}-
-            ws-${{ runner.os }}-${{ inputs.base }}-
+          path: ${{ steps.prepare.outputs.ws_paths }}
+          key: ${{ steps.prepare.outputs.ws_restore_key }}
+          restore-keys: ${{ steps.prepare.outputs.ws_restore_keys }}
+
+      - name: Restore (open the encrypted workspace cache, when there is one)
+        continue-on-error: true
+        env:
+          HEXAD_CACHE_KEY: ${{ secrets.HEXAD_BOX_KEY }}
+        run: bash "$HEXAD_TMP/phases/restore.sh"
 
       - name: Run the daemon (until hexad stops it, it idles out, or the time limit)
         timeout-minutes: 345
-        run: |
-          d="$HEXAD_TMP/daemon/$HEXAD_BUILD"
-          mkdir -p "$HEXAD_TMP/hexad-scratch"
-          dotnet exec --runtimeconfig "$d/Hexad.Daemon.runtimeconfig.json" --depsfile "$d/Hexad.Daemon.deps.json" "$d/Hexad.Daemon.dll" \
-            --root "$HEXAD_BOX" --connect "${HEXAD_SERVER/#https:/wss:}/daemon" \
-            --checkpoint-mode branch --scratch "$HEXAD_TMP/hexad-scratch" --bundles "$HEXAD_TMP/daemon" --update none \
-            --label "$HEXAD_LABEL" --idle-exit "$HEXAD_IDLE" --max-minutes "$HEXAD_MAX" --max-attempts 0 || echo "the daemon exited with $?"
+        run: bash "$HEXAD_TMP/phases/run.sh"
 
-      - name: Push the work to the session branch
+      - name: Wrap up (push the work, pack the build folders)
         if: always()
+        env:
+          HEXAD_CACHE_KEY: ${{ secrets.HEXAD_BOX_KEY }}
         run: |
-          cd "$HEXAD_BOX" || exit 0
-          git add -A
-          git diff --cached --quiet || git commit -q -m "hexad: work at the end of the runner job"
-          git push -q origin HEAD || echo "::warning::the final push failed; the last checkpoint is on the branch"
+          f="${HEXAD_TMP:-/nonexistent}/phases/wrapup.sh"
+          if [ -f "$f" ]; then bash "$f"; else echo "::warning::the prepare step did not finish, so there is nothing to wrap up"; fi
 
       # The reserved final steps: after the daemon has exited and the work is pushed, the caches are saved (a cache that cannot be saved
-      # is a warning, never a failure of the job).
+      # is a warning, never a failure of the job). A cache restored under its exact key is not saved again.
       - name: Save the workspace's build folders
-        if: always()
+        if: always() && steps.prepare.outputs.ws_save_key != '' && steps.ws.outputs.cache-hit != 'true'
         continue-on-error: true
         uses: actions/cache/save@v4
         with:
-          path: |
-            box/**/bin
-            box/**/obj
-            box/**/node_modules
-            box/**/dist
-            box/**/build
-            box/**/target
-            box/**/.venv
-            box/**/__pycache__
-            !box/**/bin/**/bin
-            !box/**/obj/**/obj
-            !box/**/node_modules/**/node_modules
-            !box/**/dist/**/dist
-            !box/**/build/**/build
-            !box/**/target/**/target
-            !box/**/.venv/**/.venv
-            !box/**/__pycache__/**/__pycache__
-            !box/.git
-          key: ws-${{ runner.os }}-${{ inputs.base }}-${{ inputs.session }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.prepare.outputs.ws_paths }}
+          key: ${{ steps.prepare.outputs.ws_save_key }}
 
-      - name: Save the package caches (Linux)
-        if: always() && inputs.os != 'windows' && steps.pkg-linux.outputs.cache-hit != 'true'
+      - name: Save the package caches
+        if: always() && steps.prepare.outputs.pkg_key != '' && steps.pkg.outputs.cache-hit != 'true'
         continue-on-error: true
         uses: actions/cache/save@v4
         with:
-          path: |
-            ~/.npm
-            ~/.nuget/packages
-            ~/.cache/pip
-            ~/.cache/yarn
-            ~/.local/share/pnpm/store
-            ~/.cargo/registry
-            ~/go/pkg/mod
-            ~/.m2/repository
-          key: pkg-${{ runner.os }}-${{ hashFiles('box/**/package-lock.json', 'box/**/yarn.lock', 'box/**/pnpm-lock.yaml', 'box/**/packages.lock.json', 'box/**/Directory.Packages.props', 'box/**/*.csproj', 'box/**/requirements*.txt', 'box/**/poetry.lock', 'box/**/Cargo.lock', 'box/**/go.sum', 'box/**/pom.xml') }}
-
-      - name: Save the package caches (Windows)
-        if: always() && inputs.os == 'windows' && steps.pkg-windows.outputs.cache-hit != 'true'
-        continue-on-error: true
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            ~\AppData\Local\npm-cache
-            ~\.nuget\packages
-            ~\AppData\Local\pip\Cache
-            ~\AppData\Local\Yarn\Cache
-            ~\AppData\Local\pnpm\store
-            ~\.cargo\registry
-            ~\go\pkg\mod
-            ~\.m2\repository
-          key: pkg-${{ runner.os }}-${{ hashFiles('box/**/package-lock.json', 'box/**/yarn.lock', 'box/**/pnpm-lock.yaml', 'box/**/packages.lock.json', 'box/**/Directory.Packages.props', 'box/**/*.csproj', 'box/**/requirements*.txt', 'box/**/poetry.lock', 'box/**/Cargo.lock', 'box/**/go.sum', 'box/**/pom.xml') }}
+          path: ${{ steps.prepare.outputs.pkg_paths }}
+          key: ${{ steps.prepare.outputs.pkg_key }}
