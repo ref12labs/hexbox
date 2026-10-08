@@ -1,10 +1,10 @@
 # Written by hexad (Settings, Runner, Install/Update workflow); hexad replaces it when it is outdated, so do not edit it here.
-# STUB_VERSION: 1
+# STUB_VERSION: 2
 # This file is a stub and rarely changes: it holds only what must be YAML. The logic is in phase scripts that the hexad which starts the
 # job serves (GET /daemon/script/<build>/<phase>), so it always matches that hexad's build.
 # This repository is public: inputs and logs are visible to anyone. The one secret input is encrypted (AES-GCM) with the
 # repository secret HEXAD_BOX_KEY, and the prepare step masks every value in it before anything can print it.
-# Runs on Linux (ubuntu-latest) or Windows (windows-latest), chosen per session by the dispatch input os; every step runs in bash.
+# Runs on Linux (ubuntu-latest) or Windows (windows-latest), chosen per session by the dispatch input os; every step runs in pwsh (PowerShell 7, preinstalled on both images).
 # Caches: hexad's prepare script decides the keys and paths (step outputs) and the actions/cache steps here pass them on. Package folders are
 # shared by every session; the workspace's build folders belong to one session (ws-<os>-<base>-<session>-<run>).
 # Outside contributors' workflows must need approval in this repository (Settings, Actions, General), because pull-request
@@ -45,7 +45,7 @@ jobs:
     timeout-minutes: 350
     defaults:
       run:
-        shell: bash
+        shell: pwsh
     steps:
       # A plain run: step does not get the runner's runtime token and results URL; a JavaScript action does. Pinned to a full commit SHA.
       - name: Expose the Actions runtime
@@ -69,7 +69,7 @@ jobs:
           HEXAD_SESSION: ${{ inputs.session }}
           HEXAD_BASE: ${{ inputs.base }}
         run: |
-          node <<'JS'
+          @'
           const crypto = require('crypto'), fs = require('fs'), path = require('path');
           const all = Buffer.from(process.env.HEXAD_BOOTSTRAP, 'base64');
           const d = crypto.createDecipheriv('aes-256-gcm', Buffer.from(process.env.HEXAD_KEY, 'base64'), all.subarray(0, 12));
@@ -90,7 +90,7 @@ jobs:
           for (const m of masks) console.log('::add-mask::' + m);
           const tmp = process.env.RUNNER_TEMP;
           fs.writeFileSync(path.join(tmp, 'hexad_key'), b.deployKey.endsWith('\n') ? b.deployKey : b.deployKey + '\n', { mode: 0o600 });
-          // Paths for bash and for git's ssh (which runs the command through sh): forward slashes, also on Windows (D:\a\_temp -> D:/a/_temp).
+          // Paths for the scripts and for git's ssh (which runs the command through sh): forward slashes, also on Windows (D:\a\_temp -> D:/a/_temp).
           const slash = s => (s || '').replace(/\\/g, '/');
           const env = {
             HEXAD_TMP: slash(tmp), HEXAD_BOX: slash(process.env.GITHUB_WORKSPACE) + '/box', HEXAD_OS: process.platform === 'win32' ? 'windows' : 'linux',
@@ -98,37 +98,41 @@ jobs:
             HEXAD_SERVER: b.server, HEXAD_TUNNEL_TOKEN: b.tunnelToken || '', HEXAD_TUNNEL_HEADERS: b.tunnelHeaders || '', HEXAD_JOIN_CODE: b.joinCode, HEXAD_REPO: b.repo, HEXAD_BRANCH: b.branch,
             HEXAD_BUILD: b.build, HEXAD_LABEL: b.label, HEXAD_IDLE: String(b.idleMinutes), HEXAD_MAX: String(b.maxMinutes),
           };
-          const q = v => "'" + String(v).replace(/'/g, "'\\''") + "'";
-          let sh = '';
           for (const [k, v] of Object.entries(env)) {
             const eof = 'EOF_' + crypto.randomBytes(8).toString('hex');
             fs.appendFileSync(process.env.GITHUB_ENV, k + '<<' + eof + '\n' + v + '\n' + eof + '\n');
-            sh += 'export ' + k + '=' + q(v) + '\n';
           }
-          // For the rest of this step only: its shell sources this file and deletes it.
-          fs.writeFileSync(path.join(tmp, 'hexad.env'), sh, { mode: 0o600 });
-          JS
-          set -euo pipefail
-          t=$(cygpath -u "$RUNNER_TEMP" 2>/dev/null || printf '%s' "$RUNNER_TEMP")
-          set -a; . "$t/hexad.env"; set +a; rm -f "$t/hexad.env"
-          fail() { echo "::error::$*"; exit 1; }
-          hint="likely missing Access headers or a stale workflow file (update it under Settings, Runner)"
+          // For the rest of this step only: its pwsh reads this file into the environment and deletes it.
+          fs.writeFileSync(path.join(tmp, 'hexad.env.json'), JSON.stringify(env), { mode: 0o600 });
+          '@ | node -
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          $envFile = Join-Path $env:RUNNER_TEMP 'hexad.env.json'
+          foreach ($p in (Get-Content -Raw -LiteralPath $envFile | ConvertFrom-Json).PSObject.Properties) { Set-Item -Path ('env:' + $p.Name) -Value ([string]$p.Value) }
+          Remove-Item -Force -LiteralPath $envFile
+          function Fail($m) { Write-Host "::error::$m"; exit 1 }
+          $hint = 'likely missing Access headers or a stale workflow file (update it under Settings, Runner)'
           # What the server's door needs on every call: a dev tunnel's token, or the tunnel bus's Access headers (one per line).
-          auth=()
-          if [ -n "$HEXAD_TUNNEL_TOKEN" ]; then auth+=(-H "X-Tunnel-Authorization: tunnel $HEXAD_TUNNEL_TOKEN"); fi
-          while IFS= read -r line; do if [ -n "$line" ]; then auth+=(-H "$line"); fi; done <<< "$HEXAD_TUNNEL_HEADERS"
-          mkdir -p "$HEXAD_TMP/phases"
-          ct=$(curl -fsS --retry 3 --retry-delay 3 -X POST "${auth[@]}" -H 'Content-Type: application/json' -d "{\"code\":\"$HEXAD_JOIN_CODE\"}" -o "$HEXAD_TMP/join.json" -w '%{content_type}' "$HEXAD_SERVER/daemon/join") || fail "hexad's /daemon/join refused the call (curl's message is above): $hint"
-          case "$ct" in application/json*) ;; *) fail "hexad's /daemon/join answered with $ct, a login or HTML page and not JSON: $hint" ;; esac
-          token=$(sed -n 's/.*"token" *: *"\([^"]*\)".*/\1/p' "$HEXAD_TMP/join.json")
-          rm -f "$HEXAD_TMP/join.json"
-          [ -n "$token" ] || fail "hexad's /daemon/join answered without a token: $hint"
-          echo "::add-mask::$token"
-          echo "HEXAD_DAEMON_TOKEN=$token" >> "$GITHUB_ENV"
-          export HEXAD_DAEMON_TOKEN="$token"
-          ct=$(curl -fsS --retry 3 --retry-delay 3 "${auth[@]}" -H "Authorization: Bearer $token" -o "$HEXAD_TMP/phases/prepare.sh" -w '%{content_type}' "$HEXAD_SERVER/daemon/script/$HEXAD_BUILD/prepare") || fail "hexad has no phase scripts for build $HEXAD_BUILD (curl's message is above): is this workflow newer than the hexad that started the job?"
-          case "$ct" in text/html*) fail "hexad's prepare script came as an HTML page, not a script: $hint" ;; esac
-          exec bash "$HEXAD_TMP/phases/prepare.sh"
+          $auth = @{}
+          if ($env:HEXAD_TUNNEL_TOKEN) { $auth['X-Tunnel-Authorization'] = "tunnel $env:HEXAD_TUNNEL_TOKEN" }
+          foreach ($line in ($env:HEXAD_TUNNEL_HEADERS -split "`n")) { $i = $line.IndexOf(':'); if ($i -gt 0) { $auth[$line.Substring(0, $i).Trim()] = $line.Substring($i + 1).Trim() } }
+          New-Item -ItemType Directory -Force -Path "$env:HEXAD_TMP/phases" | Out-Null
+          try { $r = Invoke-WebRequest -Method Post -Uri "$env:HEXAD_SERVER/daemon/join" -Headers $auth -ContentType 'application/json' -Body (@{ code = $env:HEXAD_JOIN_CODE } | ConvertTo-Json -Compress) -MaximumRetryCount 3 -RetryIntervalSec 3 }
+          catch { Fail "hexad's /daemon/join refused the call ($($_.Exception.Message)): $hint" }
+          $ct = "$($r.Headers['Content-Type'])"
+          if ($ct -notlike 'application/json*') { Fail "hexad's /daemon/join answered with $ct, a login or HTML page and not JSON: $hint" }
+          $token = ($r.Content | ConvertFrom-Json).token
+          if (-not $token) { Fail "hexad's /daemon/join answered without a token: $hint" }
+          Write-Host "::add-mask::$token"
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "HEXAD_DAEMON_TOKEN=$token"
+          $env:HEXAD_DAEMON_TOKEN = $token
+          $auth['Authorization'] = "Bearer $token"
+          $prepare = "$env:HEXAD_TMP/phases/prepare.ps1"
+          try { $r = Invoke-WebRequest -Uri "$env:HEXAD_SERVER/daemon/script/$env:HEXAD_BUILD/prepare" -Headers $auth -OutFile $prepare -PassThru -MaximumRetryCount 3 -RetryIntervalSec 3 }
+          catch { Fail "hexad has no phase scripts for build $env:HEXAD_BUILD ($($_.Exception.Message)): is this workflow newer than the hexad that started the job?" }
+          if ("$($r.Headers['Content-Type'])" -like 'text/html*') { Fail "hexad's prepare script came as an HTML page, not a script: $hint" }
+          pwsh -NoProfile -File $prepare
+          exit $LASTEXITCODE
 
       - name: Restore the package caches
         id: pkg
@@ -154,19 +158,19 @@ jobs:
         continue-on-error: true
         env:
           HEXAD_CACHE_KEY: ${{ secrets.HEXAD_BOX_KEY }}
-        run: bash "$HEXAD_TMP/phases/restore.sh"
+        run: pwsh -NoProfile -File "$env:HEXAD_TMP/phases/restore.ps1"
 
       - name: Run the daemon (until hexad stops it, it idles out, or the time limit)
         timeout-minutes: 345
-        run: bash "$HEXAD_TMP/phases/run.sh"
+        run: pwsh -NoProfile -File "$env:HEXAD_TMP/phases/run.ps1"
 
       - name: Wrap up (push the work, pack the build folders)
         if: always()
         env:
           HEXAD_CACHE_KEY: ${{ secrets.HEXAD_BOX_KEY }}
         run: |
-          f="${HEXAD_TMP:-/nonexistent}/phases/wrapup.sh"
-          if [ -f "$f" ]; then bash "$f"; else echo "::warning::the prepare step did not finish, so there is nothing to wrap up"; fi
+          $f = "$env:HEXAD_TMP/phases/wrapup.ps1"
+          if ($env:HEXAD_TMP -and (Test-Path -LiteralPath $f)) { pwsh -NoProfile -File $f } else { Write-Host "::warning::the prepare step did not finish, so there is nothing to wrap up" }
 
       # The reserved final steps: after the daemon has exited and the work is pushed, the caches are saved (a cache that cannot be saved
       # is a warning, never a failure of the job). A cache restored under its exact key is not saved again.
