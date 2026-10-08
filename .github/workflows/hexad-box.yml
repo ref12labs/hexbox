@@ -1,12 +1,13 @@
 # Written by hexad (Settings, Runner, Install/Update workflow); hexad replaces it when it is outdated, so do not edit it here.
-# STUB_VERSION: 2
+# STUB_VERSION: 3
 # This file is a stub and rarely changes: it holds only what must be YAML. The logic is in phase scripts that the hexad which starts the
 # job serves (GET /daemon/script/<build>/<phase>), so it always matches that hexad's build.
 # This repository is public: inputs and logs are visible to anyone. The one secret input is encrypted (AES-GCM) with the
 # repository secret HEXAD_BOX_KEY, and the prepare step masks every value in it before anything can print it.
 # Runs on Linux (ubuntu-latest) or Windows (windows-latest), chosen per session by the dispatch input os; every step runs in pwsh (PowerShell 7, preinstalled on both images).
-# Caches: hexad's prepare script decides the keys and paths (step outputs) and the actions/cache steps here pass them on. Package folders are
-# shared by every session; the workspace's build folders belong to one session (ws-<os>-<base>-<session>-<run>).
+# Caches: off by default (the prepare script then writes empty keys and every cache step below is skipped). With caching set to per-session
+# the prepare script decides the keys and paths (step outputs), all of them carrying the session id and with no fallback to any other
+# session, project or base branch; the actions/cache steps here pass them on.
 # Outside contributors' workflows must need approval in this repository (Settings, Actions, General), because pull-request
 # workflows can read the base branch's caches.
 name: hexad-box
@@ -96,7 +97,7 @@ jobs:
             HEXAD_TMP: slash(tmp), HEXAD_BOX: slash(process.env.GITHUB_WORKSPACE) + '/box', HEXAD_OS: process.platform === 'win32' ? 'windows' : 'linux',
             HEXAD_SESSION: process.env.HEXAD_SESSION, HEXAD_BASE: process.env.HEXAD_BASE || 'none',
             HEXAD_SERVER: b.server, HEXAD_TUNNEL_TOKEN: b.tunnelToken || '', HEXAD_TUNNEL_HEADERS: b.tunnelHeaders || '', HEXAD_JOIN_CODE: b.joinCode, HEXAD_REPO: b.repo, HEXAD_BRANCH: b.branch,
-            HEXAD_BUILD: b.build, HEXAD_LABEL: b.label, HEXAD_IDLE: String(b.idleMinutes), HEXAD_MAX: String(b.maxMinutes),
+            HEXAD_CACHE: b.cache || 'off', HEXAD_BUILD: b.build, HEXAD_LABEL: b.label, HEXAD_IDLE: String(b.idleMinutes), HEXAD_MAX: String(b.maxMinutes),
           };
           for (const [k, v] of Object.entries(env)) {
             const eof = 'EOF_' + crypto.randomBytes(8).toString('hex');
@@ -155,6 +156,7 @@ jobs:
           restore-keys: ${{ steps.prepare.outputs.ws_restore_keys }}
 
       - name: Restore (open the encrypted workspace cache, when there is one)
+        if: steps.prepare.outputs.ws_restore_key != ''
         continue-on-error: true
         env:
           HEXAD_CACHE_KEY: ${{ secrets.HEXAD_BOX_KEY }}
