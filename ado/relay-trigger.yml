@@ -36,7 +36,7 @@ jobs:
             connectionType: connectedServiceName
             serviceConnection: relay-github-dispatch
             method: POST
-            urlSuffix: /repos/ref12labs/hexbox/actions/workflows/relay.yml/dispatches
+            urlSuffix: repos/ref12labs/hexbox/actions/workflows/relay.yml/dispatches
             # Replace the task's defaults: NEVER send ADO System.AccessToken to GitHub.
             headers: |
               {
