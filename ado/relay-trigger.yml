@@ -1,0 +1,63 @@
+# Create the two service connections described in docs/runner-relay.md first.
+trigger: none
+pr: none
+
+resources:
+  webhooks:
+    - webhook: GitHubRelay
+      connection: relay-webbox-incoming
+      filters:
+        - path: action
+          value: queued
+        - path: repository.full_name
+          value: ref12labs/webbox
+
+# Set the pipeline's "Default branch for manual and scheduled builds" to the
+# branch containing this file. Incoming webhooks compile YAML from that branch.
+variables:
+  relayRef: main
+
+jobs:
+  - job: Relay
+    displayName: GitHub workflow_job relay
+    pool: server
+    timeoutInMinutes: 5
+    steps:
+      # Server jobs cannot run bash/PowerShell. Zero-minute Delay tasks provide
+      # readable timeline/log entries without an agent or another service.
+      - task: Delay@1
+        displayName: 'Received repo=${{ parameters.GitHubRelay.repository.full_name }} run=${{ parameters.GitHubRelay.workflow_job.run_id }} job=${{ parameters.GitHubRelay.workflow_job.id }} labels=${{ join('','', parameters.GitHubRelay.workflow_job.labels) }}'
+        inputs:
+          delayForMinutes: '0'
+      - ${{ if and(eq(parameters.GitHubRelay.action, 'queued'), eq(parameters.GitHubRelay.repository.full_name, 'ref12labs/webbox'), or(containsValue(parameters.GitHubRelay.workflow_job.labels, 'relay-linux'), containsValue(parameters.GitHubRelay.workflow_job.labels, 'relay-windows'))) }}:
+        - task: InvokeRESTAPI@1
+          displayName: 'Dispatch hexbox relay (HTTP success = accepted, not private job completion)'
+          inputs:
+            connectionType: connectedServiceName
+            serviceConnection: relay-github-dispatch
+            method: POST
+            urlSuffix: /repos/ref12labs/hexbox/actions/workflows/relay.yml/dispatches
+            # Replace the task's defaults: NEVER send ADO System.AccessToken to GitHub.
+            headers: |
+              {
+                "Content-Type": "application/json",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2026-03-10",
+                "User-Agent": "ado-runner-relay"
+              }
+            ${{ if containsValue(parameters.GitHubRelay.workflow_job.labels, 'relay-windows') }}:
+              body: |
+                {"ref":"$(relayRef)","inputs":{"repo":"${{ parameters.GitHubRelay.repository.full_name }}","run_id":"${{ parameters.GitHubRelay.workflow_job.run_id }}","job_id":"${{ parameters.GitHubRelay.workflow_job.id }}","os":"windows"}}
+            ${{ else }}:
+              body: |
+                {"ref":"$(relayRef)","inputs":{"repo":"${{ parameters.GitHubRelay.repository.full_name }}","run_id":"${{ parameters.GitHubRelay.workflow_job.run_id }}","job_id":"${{ parameters.GitHubRelay.workflow_job.id }}","os":"linux"}}
+            waitForCompletion: 'false'
+        - task: Delay@1
+          displayName: 'Dispatch accepted; open hexbox Actions for runner startup and webbox Actions for private job logs'
+          inputs:
+            delayForMinutes: '0'
+      - ${{ else }}:
+        - task: Delay@1
+          displayName: 'Skipped cleanly: not a queued allowlisted job with relay-linux or relay-windows'
+          inputs:
+            delayForMinutes: '0'

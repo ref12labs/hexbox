@@ -1,0 +1,34 @@
+--- a/.github/workflows/keyvault.yml
++++ b/.github/workflows/keyvault.yml
+@@ -18 +18 @@
+-    runs-on: [self-hosted, relay, relay-linux]
++    runs-on: [relay-linux, 'run-${{ github.run_id }}']
+--- a/.github/workflows/pages.yml
++++ b/.github/workflows/pages.yml
+@@ -21 +21 @@
+-    runs-on: [self-hosted, relay, relay-linux]
++    runs-on: [relay-linux, 'run-${{ github.run_id }}']
+--- a/.github/workflows/player-e2e.yml
++++ b/.github/workflows/player-e2e.yml
+@@ -17 +17 @@
+-    runs-on: [self-hosted, relay, relay-windows]
++    runs-on: [relay-windows, 'run-${{ github.run_id }}']
+--- a/.github/workflows/player.yml
++++ b/.github/workflows/player.yml
+@@ -18 +18 @@
+-    runs-on: [self-hosted, relay, relay-linux]
++    runs-on: [relay-linux, 'run-${{ github.run_id }}']
+--- a/.github/workflows/playerd.yml
++++ b/.github/workflows/playerd.yml
+@@ -25 +25 @@
+-    runs-on: [self-hosted, relay, relay-windows]
++    runs-on: [relay-windows, 'run-${{ github.run_id }}']
+@@ -66 +66 @@
+-    runs-on: [self-hosted, relay, relay-linux]
++    runs-on: [relay-linux, 'run-${{ github.run_id }}']
+@@ -94 +94 @@
+-    runs-on: [self-hosted, relay, relay-linux]
++    runs-on: [relay-linux, 'run-${{ github.run_id }}']
+@@ -178 +178 @@
+-    runs-on: [self-hosted, relay, relay-linux]
++    runs-on: [relay-linux, 'run-${{ github.run_id }}']
