@@ -119,7 +119,13 @@ jobs:
           foreach ($line in ($env:HEXAD_TUNNEL_HEADERS -split "`n")) { $i = $line.IndexOf(':'); if ($i -gt 0) { $auth[$line.Substring(0, $i).Trim()] = $line.Substring($i + 1).Trim() } }
           New-Item -ItemType Directory -Force -Path "$env:HEXAD_TMP/phases" | Out-Null
           try { $r = Invoke-WebRequest -Method Post -Uri "$env:HEXAD_SERVER/daemon/join" -Headers $auth -ContentType 'application/json' -Body (@{ code = $env:HEXAD_JOIN_CODE } | ConvertTo-Json -Compress) -MaximumRetryCount 3 -RetryIntervalSec 3 }
-          catch { Fail "hexad's /daemon/join refused the call ($($_.Exception.Message)): $hint" }
+          catch {
+            $why = "$($_.Exception.Message)"; $body = "$($_.ErrorDetails.Message)"; $code = if ($_.Exception.Response) { [int]$_.Exception.Response.StatusCode } else { 0 }
+            $reason = try { ($body | ConvertFrom-Json -ErrorAction Stop).error } catch { $null }
+            if ($reason) { Fail "hexad's /daemon/join refused the call ($code): $reason" }
+            elseif ($body -match '<html|<!doctype' -or ($code -ge 300 -and $code -lt 400)) { Fail "hexad's /daemon/join refused the call ($why): $hint" }
+            else { Fail "hexad's /daemon/join failed ($why); no reason came back from hexad" }
+          }
           $ct = "$($r.Headers['Content-Type'])"
           if ($ct -notlike 'application/json*') { Fail "hexad's /daemon/join answered with $ct, a login or HTML page and not JSON: $hint" }
           $token = ($r.Content | ConvertFrom-Json).token
